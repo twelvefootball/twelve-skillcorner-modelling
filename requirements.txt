@@ -1,0 +1,4 @@
+pandas==2.3.3
+streamlit==1.52.2
+mplsoccer==1.6.1
+dotenv==0.9.9
