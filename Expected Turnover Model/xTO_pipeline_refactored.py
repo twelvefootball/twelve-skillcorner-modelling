@@ -3,7 +3,7 @@
 CHAIN-LEVEL xTURNOVER MODEL with Exact Game-Theoretic Shapley Values
 
 Execution from Repository Root:
-    python "Expected Turnover Model/xTO_pipeline_refactored.py"
+    python "Week 8/xTO_pipeline.py"
 
 Architecture:
 1. Model predicts turnover probability for ENTIRE pressing chains (not individual engagements)
@@ -13,15 +13,15 @@ Architecture:
 5. Marginal Value: Derived from properly weighted factorial permutations of subset inclusions
 
 Key Features:
-- Chain-level aggregates: AUC pressure, spatial extent, coordination metrics
+- Chain-level aggregates: radial closing velocity, spatial extent, coordination metrics
 - Exact Game-Theoretic Shapley attribution for margin
 - Game state context (passing options, defensive line height)
-- Pure 2D Geometric Spatial proxies (LNS, AZMT)
+- Pure 2D Geometric Spatial proxies (LNS, Defensive Proximity)
 - Isotonic Regression calibration
 - Total Value Recovery & Temporal Proximity Decay
 
 Author: Efstathios Papadopoulos
-Date: April 2026
+Date: March 2026
 """
 
 import pandas as pd
@@ -69,23 +69,16 @@ class Config:
     OUTPUT_DIR: Path
     FPS: float = 10.0
 
-    # Physics Constants (Bekkers Model)
-    MAX_SPEED: float = 7.0        
-    REACTION_TIME: float = 0.7    
-    TARGET_WINDOW: float = 1.5    
-    LOGISTIC_SIGMA: float = 0.45  
-    EPSILON: float = 1e-5
-
 def resolve_paths() -> Config:
     """Intelligently resolves data and output paths across devices."""
-    base_dir = Path(__file__).resolve().parent
+    base_dir = Path(__file__).resolve().parent.parent
     
     load_dotenv(base_dir / ".env")
     env_path = os.getenv("SKILLCORNER_DATA_DIR")
     
     candidate_paths = [
         Path("C:/SkillcornerData/1/2024"),       
-        base_dir.parent / "SkillcornerData/1/2024"      
+        base_dir / "SkillcornerData/1/2024"      
     ]
     if env_path:
         candidate_paths.insert(0, Path(env_path))
@@ -126,29 +119,24 @@ CONFIG = resolve_paths()
 
 class PhysicsEngine:
     @staticmethod
-    def calculate_bekkers_pressure(df: pd.DataFrame, config: Config = CONFIG) -> np.ndarray:
-        p_future_x = df['x'].values + (df['vx'].values * config.REACTION_TIME)
-        p_future_y = df['y'].values + (df['vy'].values * config.REACTION_TIME)
-        b_future_x = df['ball_x'].values + (df['ball_vx'].values * config.REACTION_TIME)
-        b_future_y = df['ball_y'].values + (df['ball_vy'].values * config.REACTION_TIME)
-        
-        dist = np.sqrt((b_future_x - p_future_x)**2 + (b_future_y - p_future_y)**2)
-        tau_dist = dist / config.MAX_SPEED
-        
-        u_x, u_y = df['vx'].values, df['vy'].values
-        v_x, v_y = (b_future_x - df['x'].values), (b_future_y - df['y'].values)
-        dot = (u_x * v_x) + (u_y * v_y)
-        norm = np.sqrt(u_x**2 + u_y**2) * np.sqrt(v_x**2 + v_y**2)
-        beta = np.arccos(np.clip(dot / (norm + config.EPSILON), -1, 1))
-        tau_beta = (np.sqrt(u_x**2 + u_y**2) * beta) / np.pi
-        
-        T_ij = config.REACTION_TIME + tau_dist + tau_beta
-        exponent = np.clip((-np.pi / (np.sqrt(3) * config.LOGISTIC_SIGMA)) * (config.TARGET_WINDOW - T_ij), -100, 100)
-        p_ij = 1 / (1 + np.exp(exponent))
-        
-        speed = np.sqrt(df['vx'].values**2 + df['vy'].values**2)
-        p_ij = np.where(speed < 2.0, 0.0, p_ij)
-        return p_ij
+    def calculate_radial_closing_velocity(df_track: pd.DataFrame) -> np.ndarray:
+        dx = df_track['ball_x'].to_numpy() - df_track['x'].to_numpy()
+        dy = df_track['ball_y'].to_numpy() - df_track['y'].to_numpy()
+        dvx = df_track['ball_vx'].to_numpy() - df_track['vx'].to_numpy()
+        dvy = df_track['ball_vy'].to_numpy() - df_track['vy'].to_numpy()
+
+        dist = np.hypot(dx, dy)
+        numer = (dx * dvx) + (dy * dvy)
+
+        radial_velocity = np.zeros_like(dist, dtype=np.float64)
+        valid = dist >= 1e-5
+        radial_velocity[valid] = numer[valid] / dist[valid]
+
+        same_team_as_possession = (df_track['team_id'].to_numpy() == df_track['possession_team_id'].to_numpy())
+        radial_velocity[same_team_as_possession] = 0.0
+
+        radial_velocity = np.clip(radial_velocity, a_min=0.0, a_max=None)
+        return radial_velocity
 
     @staticmethod
     def compute_all_player_velocities(players_df: pd.DataFrame, fps: float = 10.0) -> pd.DataFrame:
@@ -265,16 +253,22 @@ class ChainFeatureEngine:
 
     @staticmethod
     def normalize_attacking_direction(engagements_df: pd.DataFrame) -> pd.DataFrame:
-        if 'attacking_side' in engagements_df.columns:
-            flip_mask = engagements_df['attacking_side'] == 'right_to_left'
-            if flip_mask.any():
-                position_cols = ['x_start', 'y_start']
-                if 'x_end' in engagements_df.columns: position_cols.append('x_end')
-                if 'y_end' in engagements_df.columns: position_cols.append('y_end')
+        """
+        Forces all engagements to be projected as if the pressing team is attacking 
+        from left to right (towards X = +52.5).
+        """
+        # High blocks by definition happen in the opponent's half.
+        # If x_start < 0, the pressing team's attacking direction was right_to_left and must be flipped.
+        flip_mask = engagements_df['x_start'] < 0
+
+        position_cols = ['x_start', 'y_start']
+        if 'x_end' in engagements_df.columns: position_cols.append('x_end')
+        if 'y_end' in engagements_df.columns: position_cols.append('y_end')
+        
+        for col in position_cols:
+            if col in engagements_df.columns:
+                engagements_df.loc[flip_mask, col] = -engagements_df.loc[flip_mask, col]
                 
-                for col in position_cols:
-                    if col in engagements_df.columns:
-                        engagements_df.loc[flip_mask, col] = -engagements_df.loc[flip_mask, col]
         return engagements_df
 
     @staticmethod
@@ -291,26 +285,6 @@ class ChainFeatureEngine:
         else:
             engagements_df['n_passing_options_before'] = 0
             engagements_df['n_passing_options_after'] = 0
-        return engagements_df
-
-    @staticmethod
-    def calculate_engagement_pressure_auc(engagements_df: pd.DataFrame, player_pressures: pd.DataFrame, fps: float = 10.0) -> pd.DataFrame:
-        if 'frame_end' in engagements_df.columns:
-            eng_windows = engagements_df[['event_id', 'player_id', 'frame_start', 'frame_end']].copy()
-            eng_windows['frame_end']   = eng_windows['frame_end'].fillna(eng_windows['frame_start']).astype(int)
-            eng_windows['frame_start'] = eng_windows['frame_start'].astype(int)
-            auc_merge = player_pressures.merge(eng_windows, on='player_id', how='inner')
-            in_window = ((auc_merge['frame'] >= auc_merge['frame_start']) &
-                         (auc_merge['frame'] <= auc_merge['frame_end']))
-            auc_by_eng = (auc_merge[in_window]
-                          .groupby('event_id')['pressure_prob']
-                          .sum()
-                          .div(fps)
-                          .rename('engagement_pressure_auc'))
-            engagements_df = engagements_df.merge(auc_by_eng, on='event_id', how='left')
-        else:
-            engagements_df['engagement_pressure_auc'] = 0.0
-        engagements_df['engagement_pressure_auc'] = engagements_df['engagement_pressure_auc'].fillna(0.0)
         return engagements_df
 
     @staticmethod
@@ -338,33 +312,39 @@ class ChainFeatureEngine:
             lns = len(def_15m) - len(att_15m)
             def_ids = def_15m['player_id'].tolist()
             
-            azmt = 0.0
-            azmt_loo_player = {}
+            defensive_proximity = 0.0
+            defensive_proximity_loo_player = {}
             
-            if len(att_15m) > 0 and len(def_15m) > 0:
-                att_coords = att_15m[['x', 'y']].values
-                def_coords = def_15m[['x', 'y']].values
+            if len(attackers) > 0 and len(defenders) > 0:
+                att_coords = attackers[['x', 'y']].values
+                def_coords = defenders[['x', 'y']].values
                 dists = cdist(att_coords, def_coords)
                 min_dists = dists.min(axis=1)
-                azmt = min_dists.mean()
+                defensive_proximity = min_dists.mean()
                 
-                for j, def_id in enumerate(def_ids):
-                    if len(def_15m) == 1:
-                        azmt_loo_player[def_id] = 0.0
+                all_def_ids = defenders['player_id'].tolist()
+                for j, def_id in enumerate(all_def_ids):
+                    if len(defenders) == 1:
+                        defensive_proximity_loo_player[def_id] = 0.0
                     else:
                         dists_loo = np.delete(dists, j, axis=1)
-                        azmt_loo_player[def_id] = dists_loo.min(axis=1).mean()
+                        defensive_proximity_loo_player[def_id] = dists_loo.min(axis=1).mean()
                         
             frame_metrics.append({
-                'frame_start': f, 'LNS': lns, 'AZMT': azmt,
-                'defenders_15m': def_ids, 'azmt_loo_dict': azmt_loo_player
+                'frame_start': f, 'LNS': lns, 'Defensive_Proximity': defensive_proximity,
+                'defenders_15m': def_ids, 'defensive_proximity_loo_dict': defensive_proximity_loo_player
             })
             
         metrics_df = pd.DataFrame(frame_metrics)
         return metrics_df
 
     @staticmethod
-    def calculate_base_features(engagements_df: pd.DataFrame, frame_pressure: pd.DataFrame, fps: float = 10.0):
+    def calculate_base_features(
+        engagements_df: pd.DataFrame,
+        frame_max_radial_velocity: pd.DataFrame,
+        player_radial_velocity: pd.DataFrame,
+        fps: float = 10.0
+    ):
         engagements_df['dist_to_goal'] = np.sqrt((52.5 - engagements_df['x_start'])**2 + (0 - engagements_df['y_start'])**2)
         
         if 'last_defensive_line_height_start' in engagements_df.columns:
@@ -373,27 +353,50 @@ class ChainFeatureEngine:
             engagements_df['defensive_line_height'] = 0.33
         
         if 'x_end' in engagements_df.columns and 'x_start' in engagements_df.columns:
-            engagements_df['pressing_distance'] = np.sqrt((engagements_df['x_end'] - engagements_df['x_start'])**2 + 
-                                                           (engagements_df['y_end'] - engagements_df['y_start'])**2)
             engagements_df['forward_pressing'] = (engagements_df['x_end'] - engagements_df['x_start'] > 0.5).astype(int)
         else:
-            engagements_df['pressing_distance'] = 0
             engagements_df['forward_pressing'] = 0
         
         engagements_df['pressing_chain_length'] = engagements_df['pressing_chain_length'].fillna(1) if 'pressing_chain_length' in engagements_df.columns else 1
-        
-        if 'engagement_pressure_auc' not in engagements_df.columns:
-            engagements_df['engagement_pressure_auc'] = 0.0
 
         engagements_df['engagement_delta_options'] = (
             engagements_df['n_passing_options_after'].fillna(0) - 
             engagements_df['n_passing_options_before'].fillna(0)
         )
-
-        engagements_df = pd.merge(engagements_df, frame_pressure, left_on='frame_start', right_on='frame', how='left')
-        engagements_df['frame_max_pressure'] = engagements_df['frame_max_pressure'].fillna(0)
         
         if 'frame_end' not in engagements_df.columns: engagements_df['frame_end'] = engagements_df['frame_start']
+
+        engagements_df = engagements_df.drop(columns=['frame_max_radial_velocity'], errors='ignore')
+
+        engagements_df = pd.merge(
+            engagements_df,
+            frame_max_radial_velocity,
+            left_on='frame_start',
+            right_on='frame',
+            how='left'
+        )
+        engagements_df = engagements_df.drop(columns=['frame'], errors='ignore')
+
+        if not player_radial_velocity.empty:
+            eng_windows = engagements_df[['event_id', 'player_id', 'frame_start', 'frame_end']].copy()
+            eng_windows['frame_end'] = eng_windows['frame_end'].fillna(eng_windows['frame_start']).astype(int)
+            eng_windows['frame_start'] = eng_windows['frame_start'].astype(int)
+
+            radial_merge = player_radial_velocity.merge(eng_windows, on='player_id', how='inner')
+            in_window = (
+                (radial_merge['frame'] >= radial_merge['frame_start']) &
+                (radial_merge['frame'] <= radial_merge['frame_end'])
+            )
+            radial_by_eng = (
+                radial_merge[in_window]
+                .groupby('event_id')['radial_velocity']
+                .max()
+                .rename('frame_max_radial_velocity')
+            )
+            engagements_df = engagements_df.drop(columns=['frame_max_radial_velocity'], errors='ignore')
+            engagements_df = engagements_df.merge(radial_by_eng, on='event_id', how='left')
+
+        engagements_df['frame_max_radial_velocity'] = engagements_df['frame_max_radial_velocity'].fillna(0.0)
         engagements_df = engagements_df.sort_values(['pressing_chain_index', 'frame_start'])
 
         chain_features = engagements_df.groupby('pressing_chain_index').agg(
@@ -401,21 +404,19 @@ class ChainFeatureEngine:
             chain_start_frame=('frame_start', 'min'),
             chain_end_frame=('frame_end', 'max'),
             chain_mean_y=('y_start', 'mean'),
-            mean_press_pressure=('frame_max_pressure', 'mean'),
+            chain_max_radial_velocity=('frame_max_radial_velocity', 'max'),
             mean_dist_to_goal=('dist_to_goal', 'mean'),
-            mean_pressing_distance=('pressing_distance', 'mean'),
             forward_pressing_ratio=('forward_pressing', 'mean'),
             defensive_line_height=('defensive_line_height', 'mean'),
             chain_success=('chain_success', 'max'),
             conceded_xT=('conceded_xT', 'first'),
-            mean_delta_options=('engagement_delta_options', 'mean'),
+            mean_delta_n_passing_options=('engagement_delta_options', 'mean'),
             game_state=('game_state', 'first'),
             third_start=('third_start', 'first'),
             match_id=('match_id', 'first'),
             chain_length_sc=('pressing_chain_length', 'max'),
             chain_mean_LNS=('LNS', 'mean'),
-            chain_mean_AZMT=('AZMT', 'mean'),
-            chain_mean_auc=('engagement_pressure_auc', 'mean')
+            chain_mean_defensive_proximity=('Defensive_Proximity', 'mean')
         ).reset_index()
         
         chain_features['chain_duration'] = (chain_features['chain_end_frame'] - chain_features['chain_start_frame']) / fps
@@ -455,18 +456,15 @@ class ChainFeatureEngine:
         if not active_engs: return None
 
         count = len(active_engs)
-        mean_delta_options = sum(e.get('engagement_delta_options', 0) for e in active_engs) / count
+        mean_delta_n_passing_options = sum(e.get('engagement_delta_options', 0) for e in active_engs) / count
         mean_y = sum(e['y_start'] for e in active_engs) / count
-        chain_mean_auc = sum(e.get('engagement_pressure_auc', 0) for e in active_engs) / count
-        
-        mean_press = sum(e.get('frame_max_pressure', 0) for e in active_engs) / count
+        max_radial_velocity = max((e.get('frame_max_radial_velocity', 0) for e in active_engs), default=0.0)
         mean_dist_to_goal = sum(e['dist_to_goal'] for e in active_engs) / count
-        mean_pressing_dist = sum(e['pressing_distance'] for e in active_engs) / count
         forward_pressing_ratio = sum(e['forward_pressing'] for e in active_engs) / count
         defensive_line_height = sum(e.get('defensive_line_height', 0) for e in active_engs) / count
         
         lns_sum = 0
-        azmt_sum = 0
+        defensive_proximity_sum = 0
         for e in active_engs:
             base_lns = e.get('LNS', 0)
             defs_15m = e.get('defenders_15m', [])
@@ -474,16 +472,16 @@ class ChainFeatureEngine:
             lns_sum += (base_lns - rem_lns)
             
             if len(excluded_players) == 0:
-                azmt_sum += e.get('AZMT', 0)
+                defensive_proximity_sum += e.get('Defensive_Proximity', 0)
             elif len(excluded_players) == 1:
                 p_exc = list(excluded_players)[0]
-                loo_dict = e.get('azmt_loo_dict', {})
-                azmt_sum += loo_dict.get(p_exc, e.get('AZMT', 0))
+                loo_dict = e.get('defensive_proximity_loo_dict', {})
+                defensive_proximity_sum += loo_dict.get(p_exc, e.get('Defensive_Proximity', 0))
             else:
-                azmt_sum += e.get('AZMT', 0)
+                defensive_proximity_sum += e.get('Defensive_Proximity', 0)
                 
         mean_lns = lns_sum / count
-        mean_azmt = azmt_sum / count
+        mean_defensive_proximity = defensive_proximity_sum / count
 
         start_frame = min(e['frame_start'] for e in active_engs)
         end_frame = max(e.get('frame_end', e['frame_start']) for e in active_engs)
@@ -497,15 +495,13 @@ class ChainFeatureEngine:
             'chain_proximity_to_sideline': abs(mean_y),
             'chain_duration': sub_duration,
             'engagement_density': sub_density,
-            'mean_press_pressure': mean_press,
+            'chain_max_radial_velocity': max_radial_velocity,
             'mean_dist_to_goal': mean_dist_to_goal,
-            'mean_pressing_distance': mean_pressing_dist,
             'forward_pressing_ratio': forward_pressing_ratio,
             'defensive_line_height': defensive_line_height,
-            'mean_delta_options': mean_delta_options,
+            'mean_delta_n_passing_options': mean_delta_n_passing_options,
             'chain_mean_LNS': mean_lns,
-            'chain_mean_AZMT': mean_azmt,
-            'chain_mean_auc': chain_mean_auc,
+            'chain_mean_defensive_proximity': mean_defensive_proximity,
             'is_coordinated_press': 1 if len(subset_set) > 1 else 0
         }
         return features
@@ -538,7 +534,6 @@ class MatchProcessor:
         players = PhysicsEngine.compute_all_player_velocities(players, fps=fps)
 
         df_track = pd.merge(players, ball, on='frame', how='inner')
-        df_track['pressure_prob'] = PhysicsEngine.calculate_bekkers_pressure(df_track, config=CONFIG)
         
         _poss = (dynamic_df.dropna(subset=['team_id'])
                  [['frame_start', 'frame_end', 'team_id']]
@@ -549,11 +544,14 @@ class MatchProcessor:
         _teams  = np.repeat(_poss['team_id'].values, _n)
         frame_to_possession = dict(zip(_frames.tolist(), _teams.tolist()))
         df_track['possession_team_id'] = df_track['frame'].map(frame_to_possession)
-        df_track.loc[df_track['team_id'] == df_track['possession_team_id'], 'pressure_prob'] = 0
 
-        player_pressure_series = df_track[['frame', 'player_id', 'pressure_prob']].copy()
-        frame_pressure = df_track.groupby('frame')['pressure_prob'].max().reset_index()
-        frame_pressure.columns = ['frame', 'frame_max_pressure']
+        df_track['radial_velocity'] = PhysicsEngine.calculate_radial_closing_velocity(df_track)
+        player_radial_velocity = df_track[['frame', 'player_id', 'radial_velocity']].copy()
+        frame_max_radial_velocity = (
+            df_track.groupby('frame', as_index=False)['radial_velocity']
+            .max()
+            .rename(columns={'radial_velocity': 'frame_max_radial_velocity'})
+        )
 
         phase_outcomes = ChainFeatureEngine.extract_phase_outcomes(dynamic_df)
 
@@ -566,6 +564,16 @@ class MatchProcessor:
         
         engagement_data = ChainFeatureEngine.normalize_attacking_direction(engagement_data)
         engagement_data = ChainFeatureEngine.add_passing_options_context(engagement_data, dynamic_df)
+
+        engagement_data = pd.merge(
+            engagement_data,
+            frame_max_radial_velocity,
+            left_on='frame_start',
+            right_on='frame',
+            how='left'
+        )
+        engagement_data = engagement_data.drop(columns=['frame'], errors='ignore')
+        engagement_data['frame_max_radial_velocity'] = engagement_data['frame_max_radial_velocity'].fillna(0.0)
         
         engagement_frames = engagement_data['frame_start'].unique()
         metrics_df = ChainFeatureEngine.calculate_spatial_metrics(engagement_frames, df_track)
@@ -574,14 +582,14 @@ class MatchProcessor:
             engagement_data = pd.merge(engagement_data, metrics_df, on='frame_start', how='left')
         else:
             engagement_data['LNS'] = 0
-            engagement_data['AZMT'] = 0.0
+            engagement_data['Defensive_Proximity'] = 0.0
             engagement_data['defenders_15m'] = [[] for _ in range(len(engagement_data))]
-            engagement_data['azmt_loo_dict'] = [{} for _ in range(len(engagement_data))]
+            engagement_data['defensive_proximity_loo_dict'] = [{} for _ in range(len(engagement_data))]
             
         engagement_data['LNS'] = engagement_data['LNS'].fillna(0)
-        engagement_data['AZMT'] = engagement_data['AZMT'].fillna(0.0)
+        engagement_data['Defensive_Proximity'] = engagement_data['Defensive_Proximity'].fillna(0.0)
         engagement_data['defenders_15m'] = engagement_data['defenders_15m'].apply(lambda x: x if isinstance(x, list) else [])
-        engagement_data['azmt_loo_dict'] = engagement_data['azmt_loo_dict'].apply(lambda x: x if isinstance(x, dict) else {})
+        engagement_data['defensive_proximity_loo_dict'] = engagement_data['defensive_proximity_loo_dict'].apply(lambda x: x if isinstance(x, dict) else {})
         
         engagement_data = pd.merge(engagement_data, phase_outcomes, on='phase_index', how='left')
         engagement_data['time_to_end'] = engagement_data['phase_end_frame'] - engagement_data['frame_start']
@@ -625,11 +633,15 @@ class MatchProcessor:
                     else: conceded_xT_map[chain_id] = 0.0
         
         engagement_data['conceded_xT'] = engagement_data['pressing_chain_index'].map(conceded_xT_map).fillna(0.0)
-        engagement_data = ChainFeatureEngine.calculate_engagement_pressure_auc(engagement_data, player_pressure_series, fps=fps)
 
-        chain_df, player_chain_map, eng_with_features = ChainFeatureEngine.calculate_base_features(engagement_data, frame_pressure, fps=fps)
+        chain_df, player_chain_map, eng_with_features = ChainFeatureEngine.calculate_base_features(
+            engagement_data,
+            frame_max_radial_velocity,
+            player_radial_velocity,
+            fps=fps
+        )
 
-        del tracking_df, dynamic_df, df_track, players, ball, engagement_data, player_pressure_series
+        del tracking_df, dynamic_df, df_track, players, ball, engagement_data, player_radial_velocity
         gc.collect()
 
         return {
@@ -1008,6 +1020,7 @@ class MetricsAndExportEngine:
         metrics_df['chains_per_90'] = metrics_df['chains_participated'] * per_90_factor
         metrics_df['chains_per_match'] = metrics_df['chains_participated'] / metrics_df['matches_played'].replace(0, 1)
         metrics_df['xTurnover_per_chain'] = metrics_df['total_marginal_xTurnover_calibrated'] / metrics_df['chains_participated'].replace(0, 1)
+        metrics_df['defensive_penalty_per_chain'] = metrics_df['defensive_penalty'] / metrics_df['chains_participated'].replace(0, 1)
         
         metrics_df['defensive_penalty_per_90'] = metrics_df['defensive_penalty'] * per_90_factor
         metrics_df['net_defensive_value_per_90'] = (metrics_df['total_marginal_xTurnover_calibrated'] - metrics_df['defensive_penalty']) * per_90_factor
@@ -1061,7 +1074,7 @@ class MetricsAndExportEngine:
             avg_negative_impact=('raw_shapley_value', 'mean')
         )
         metrics_df = metrics_df.join(neg_stats).fillna(0)
-        metrics_df['negative_impact_per_90'] = metrics_df['total_negative_impact'] * per_90_factor
+        metrics_df['negative_impact_per_chain'] = metrics_df['total_negative_impact'] / metrics_df['chains_participated'].replace(0, 1)
 
         # Chain Quality
         chain_quality = marginal_df.groupby('player_id').agg(
@@ -1072,14 +1085,17 @@ class MetricsAndExportEngine:
         metrics_df = metrics_df.join(chain_quality)
 
         metrics_df['xTurnover_conversion_rate'] = metrics_df['attributed_turnovers'] / metrics_df['total_marginal_xTurnover_calibrated'].replace(0, 1)
-        metrics_df['pressing_risk'] = (metrics_df['defensive_penalty_per_90'] / metrics_df['xTurnover_per_90'].replace(0, 1))*1000
+        metrics_df['pressing_risk'] = (metrics_df['defensive_penalty_per_chain'] / metrics_df['xTurnover_per_chain'].replace(0, 1)) * 1000
 
         # Rename defensive penalty for ID match
         metrics_df.rename(columns={'defensive_penalty': 'total_defensive_penalty'}, inplace=True)
         metrics_df['total_defensive_penalty'] = metrics_df['total_defensive_penalty'].fillna(0)
 
-        # Filter minimum minutes played
-        metrics_df = metrics_df[metrics_df['minutes_played'] >= 900].copy()
+        # Eligibility filter for reliable player comparisons.
+        metrics_df = metrics_df[
+            (metrics_df['minutes_played'] >= 900) &
+            (metrics_df['chains_participated'] >= 30)
+        ].copy()
         
         # Reset index to make player_id a column
         metrics_df = metrics_df.reset_index()
@@ -1095,11 +1111,11 @@ class MetricsAndExportEngine:
             "Player Rankings": ['player_id', 'player_name', 'chains_participated', 'total_marginal_xTurnover_calibrated', 'total_defensive_penalty', 'attributed_turnovers', 'avg_chain_size', 'minutes_played', 'matches_played', 'team_name', 'xTurnover_per_90', 'defensive_penalty_per_90', 'net_defensive_value_per_90', 'attributed_turnovers_per_90', 'value_added', 'value_added_per_90'],
             "All Sub-Metrics": [c for c in sub_ranked_df.columns],
             "Activity": id_cols + ['xTurnover_per_90', 'chains_participated', 'chains_per_90', 'chains_per_match', 'avg_chain_size'],
-            "Efficiency": id_cols + ['xTurnover_per_90', 'xTurnover_per_chain', 'chains_per_90', 'avg_chain_size'],
+            "Efficiency": id_cols + ['xTurnover_per_90', 'xTurnover_per_chain', 'defensive_penalty_per_chain', 'chains_per_90', 'avg_chain_size'],
             "Solo vs Coordinated": id_cols + ['xTurnover_per_90', 'solo_xTurnover_per_90', 'coordinated_xTurnover_per_90', 'solo_xTurnover_ratio', 'solo_chains', 'coordinated_chains', 'solo_xTurnover_total', 'coordinated_xTurnover_total'],
             "Dominance & Chain Quality": id_cols + ['xTurnover_per_90', 'avg_contribution_share', 'median_contribution_share', 'avg_chain_xTurnover_full', 'max_chain_xTurnover_full', 'std_chain_xTurnover_full'],
             "Conversion & Consistency": id_cols + ['xTurnover_per_90', 'xTurnover_conversion_rate', 'attributed_turnovers', 'total_marginal_xTurnover_calibrated', 'xTurnover_per_match_mean', 'xTurnover_per_match_std', 'xTurnover_cv'],
-            "Negative Impact": id_cols + ['xTurnover_per_90', 'negative_chains', 'total_negative_impact', 'net_defensive_value_per_90', 'defensive_penalty_per_90', 'avg_negative_impact', 'negative_impact_per_90', 'pressing_risk']
+            "Negative Impact": id_cols + ['xTurnover_per_90', 'negative_chains', 'total_negative_impact', 'net_defensive_value_per_90', 'defensive_penalty_per_chain', 'avg_negative_impact', 'negative_impact_per_chain', 'pressing_risk']
         }
         
         with pd.ExcelWriter(output_path, engine='openpyxl') as writer:
@@ -1209,14 +1225,33 @@ if __name__ == "__main__":
     print(f"\n📊 Dataset Statistics:")
     print(f"   Total Chains: {len(master_chain_df):,}")
     print(f"   Total Engagements: {len(master_engagement_df):,}")
+
+    if 'chain_max_radial_velocity' not in master_chain_df.columns:
+        print("❌ Missing 'chain_max_radial_velocity' in chain features.")
+        print("   Delete pipeline_cache/preprocessing_cache.pkl and rerun the pipeline to rebuild with radial physics.")
+        sys.exit(1)
     
     # ====================================================================
     # 🧪 FEATURE EXPERIMENTATION ZONE
     # Add any columns you want to strictly EXCLUDE from the model below.
     # ====================================================================
     exclude_cols = ['global_chain_id', 'chain_success', 'conceded_xT', 'match_id', 
-                    'game_state', 'third_start', 'is_coordinated_press', 'engagement_density',
-                    'chain_size'] # Excluded due to 0.88 correlation with chain_size
+                    'game_state', 'third_start', 
+                    'engagement_density',
+                    'is_coordinated_press', 
+                    #'chain_size',
+                    #'chain_duration',
+                    'chain_mean_y',
+                    #'chain_max_radial_velocity',
+                    #'mean_dist_to_goal',
+                    #'forward_pressing_ratio',
+                    #'defensive_line_height',
+                    #'mean_delta_n_passing_options',
+                    #'chain_length_sc',
+                    #'chain_mean_LNS',
+                    #'chain_mean_defensive_proximity',
+                    #'chain_proximity_to_sideline'
+                    ]
                     
     feature_cols = [c for c in master_chain_df.columns if c not in exclude_cols]
     feature_cols = [c for c in feature_cols if master_chain_df[c].dtype in ['int64', 'float64', 'int32', 'float32']]

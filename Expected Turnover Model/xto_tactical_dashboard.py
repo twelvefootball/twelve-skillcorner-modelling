@@ -5,7 +5,7 @@ Professional Streamlit application for interactive analysis of
 Expected Turnover (xTO) defensive metrics from SkillCorner tracking data.
 
 Execution from Repository Root:
-    streamlit run "Expected Turnover Model/xto_tactical_dashboard.py"
+    streamlit run "Week 8/xto_tactical_dashboard.py"
 
 Tabs:
   1. Chain Visualizer  — "Film Room": replay pressing chains as GIFs with Shapley attribution
@@ -44,7 +44,7 @@ from dotenv import load_dotenv
 # Standardize path resolutions using Pathlib
 WORKSPACE = Path(__file__).resolve().parent
 
-load_dotenv(WORKSPACE / ".env")
+load_dotenv(WORKSPACE.parent / ".env")
 env_path = os.getenv("SKILLCORNER_DATA_DIR")
 
 candidate_paths = [
@@ -172,11 +172,17 @@ st.markdown(f"""
 # =====================================================================
 # DATA LOADING (cached)
 # =====================================================================
+minutes_threshold = 900
+chains_threshold = 40
+
 @st.cache_data(show_spinner="Loading xTO sub-metrics…")
 def load_submetrics():
     if not SUBMETRICS_PATH.exists():
         return None
-    return pd.read_parquet(SUBMETRICS_PATH)
+    df = pd.read_parquet(SUBMETRICS_PATH)
+    if {"minutes_played", "chains_participated"}.issubset(df.columns):
+        df = df[(df["minutes_played"] >= minutes_threshold) & (df["chains_participated"] >= chains_threshold)].copy()
+    return df
 
 
 @st.cache_data(show_spinner="Loading Shapley marginal contributions…")
@@ -606,8 +612,8 @@ PILLARS = [
     ("solo_xTurnover_ratio",         "Self-Sufficiency\n(Solo Ratio)"),
     ("avg_contribution_share", "Dominance\n(Contribution %)"),
     ("avg_chain_xTurnover_full",      "Tactical IQ\n(Chain Danger)"),
-    ("negative_impact_per_90",    "Shape Discipline\n(Negative xTO/90)"),
-    ("pressing_risk",    "Pressing Risk Ratio\n(xT conceded per 1000 xTO generated)"),
+    ("negative_impact_per_chain",    "Shape Discipline\n(Negative xTO/Chain)"),
+    ("pressing_risk",    "Pressing Risk Ratio\n(xT conceded per 1000 xTO, chain-based)"),
     #("defensive_penalty_per_90", "Pressing Risk\n(Defensive Penalty/90)"),
 ]
 N_PILLARS = len(PILLARS)
@@ -657,7 +663,7 @@ def build_radar_figure(players_info, peer_df):
     pillar_cols = [p[0] for p in PILLARS]
 
     # 1. Define which metrics need to be inverted (Lower = Better)
-    lower_is_better = ["pressing_risk", "defensive_penalty_per_90"]
+    lower_is_better = ["pressing_risk"]
 
     def pct_vals(row):
         out = []
@@ -963,7 +969,7 @@ with tab_scout:
         unique_pos = list(dict.fromkeys(pos_labels))
         peer_label = " + ".join(unique_pos)
 
-        st.caption(f"Percentiles relative to **{peer_label}** ({len(peer)} players, ≥900 min)")
+        st.caption(f"Percentiles relative to **{peer_label}** ({len(peer)} players, ≥{minutes_threshold} min and ≥{chains_threshold} chains)")
 
         fig, vals_list = build_radar_figure(players_info, peer)
         st.pyplot(fig, use_container_width=True)
